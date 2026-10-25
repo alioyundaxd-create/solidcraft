@@ -7,7 +7,7 @@ use truck_modeling as mt;
 use std::collections::HashMap;
 
 use crate::body::{Body, Solid, from_p3};
-use crate::boolean_diagnostics::{BooleanFallback, BooleanStrategy, capture_boolean_diagnostics, merge, record, reject};
+use crate::boolean_diagnostics::{BooleanDiagnostics, BooleanFallback, BooleanStrategy, capture_boolean_diagnostics, merge, record, reject};
 use crate::boolean_record::{self as recorded, Traced};
 use crate::{KernelError, Result, guard, record};
 
@@ -1305,7 +1305,7 @@ fn boolean_whole_with_refinement(a: &Body, b: &Body, op: BoolOp, refine: bool) -
 /// can reproduce an empty numerical attempt without depending on a particular ray seed.
 fn boolean_whole_with<F>(a: &Body, b: &Body, op: BoolOp, refine: bool, intersect: &F) -> Result<Option<Body>>
 where
-    F: Fn(&Body, &Body, BoolOp, Option<mt::Vector3>, f64) -> Result<(Solid, Option<recorded::Shapeops>)>,
+    F: Fn(&Body, &Body, BoolOp, Option<mt::Vector3>, f64) -> Result<(Solid, Option<recorded::Shapeops>)> + Sync,
 {
     if let Some(body) = swept_prism(a, b, op) {
         return Ok(Some(body));
@@ -1613,6 +1613,28 @@ where
         }
         None
     };
+    /// One shifted or refined numerical try, solved off-thread: the solid its
+    /// intersection makes (or why there is none). The diagnostic report rides along
+    /// so the replay below merges attempts in attempt order, exactly as if they ran
+    /// one after another.
+    enum PoolOut {
+        Empty,
+        Solved { body: Body, ok: bool, v: f64, unfused: bool },
+        Failed(String),
+    }
+    // The first unshifted coarse try usually decides the pair; run it alone. The
+    // remaining shifted and refined tries are independent solves of the same pair:
+    // run them together on the attempt below and replay their outcomes in attempt
+    // order, so a storm of slow sequential solves costs one slow solve instead.
+    // Order, diagnostics, empty-vote counting, fallback events and fallthrough are
+    // identical to the sequential loop. (Only without an explicit attempt budget, so
+    // a budget set by a caller still counts attempts in order.)
+    let parallel = ATTEMPTS.with(|c| c.get().is_none());
+    let mut pooled: Option<Vec<(PoolOut, BooleanDiagnostics)>> = None;
+    // Diagnostics of pooled attempts, merged in attempt order at the same points the
+    // sequential loop's records would reach the caller: on a win, and on the paths
+    // that return a result below. Dropped altogether when the boolean fails, as before.
+    let mut pool_diags: Vec<BooleanDiagnostics> = Vec::new();
     for (attempt, j) in JITTER.iter().enumerate() {
         // The operands as they lie failed. A planar tool beside the target's curved faces (a tooth
         // or a pocket cut next to a round edge) is decided exactly in the slab it lies in, where
@@ -1680,29 +1702,116 @@ where
         // the exact strategies above a chance (#1765), including seam-face recovery. If none
         // recovers it, keep the original candidate for the outer guard, before displaced retries.
         if empty_votes >= 2 && op != BoolOp::Union {
+            for d in std::mem::take(&mut pool_diags) {
+                merge(d);
+            }
             merge(empty_diagnostics);
             return Ok(None);
         }
         let shift = mt::Vector3::new(j[0], j[1], j[2]) * (size * 0.01);
-        for k in [2e-3, 5e-4] {
-            let tol = (size * k).max(1e-5);
-            let r = intersect(a, b, op, if attempt > 0 { Some(shift) } else { None }, tol);
-            match r {
-                Ok((s, _)) if s.boundaries().is_empty() || s.face_iter().next().is_none() => {
-                    empty_votes += 1;
-                    if attempt > 0 || k != 2e-3 {
-                        let mut event =
-                            BooleanFallback::new(if attempt > 0 { BooleanStrategy::ShiftedOperands } else { BooleanStrategy::RefinedTolerance });
-                        event.translation_mm = Vec3::new(j[0], j[1], j[2]).len() * (size * 0.01);
-                        event.tolerance_mm = tol;
-                        empty_diagnostics.push(event);
+        if attempt == 0 || !parallel {
+            for k in [2e-3, 5e-4] {
+                let tol = (size * k).max(1e-5);
+                let r = intersect(a, b, op, if attempt > 0 { Some(shift) } else { None }, tol);
+                match r {
+                    Ok((s, _)) if s.boundaries().is_empty() || s.face_iter().next().is_none() => {
+                        empty_votes += 1;
+                        if attempt > 0 || k != 2e-3 {
+                            let mut event =
+                                BooleanFallback::new(if attempt > 0 { BooleanStrategy::ShiftedOperands } else { BooleanStrategy::RefinedTolerance });
+                            event.translation_mm = Vec3::new(j[0], j[1], j[2]).len() * (size * 0.01);
+                            event.tolerance_mm = tol;
+                            empty_diagnostics.push(event);
+                        }
+                        last = "empty result".into();
                     }
-                    last = "empty result".into();
+                    Ok((s, h)) => match guard("boolean result", || recorded::truck_result(s, h, size, &keep, &counts)) {
+                        Ok(body) => {
+                            let (ok, v) = check(&body);
+                            if ok {
+                                if attempt > 0 || k != 2e-3 {
+                                    let mut event = BooleanFallback::new(if attempt > 0 {
+                                        BooleanStrategy::ShiftedOperands
+                                    } else {
+                                        BooleanStrategy::RefinedTolerance
+                                    });
+                                    event.translation_mm = Vec3::new(j[0], j[1], j[2]).len() * (size * 0.01);
+                                    event.tolerance_mm = tol;
+                                    record(event);
+                                }
+                                return Ok(Some(body));
+                            }
+                            last = if unfused(&body) {
+                                "the bodies touch along faces that could not be fused".into()
+                            } else {
+                                format!("implausible result volume {v:.4}")
+                            };
+                        }
+                        Err(e) => last = e.to_string(),
+                    },
+                    Err(e) => last = e.to_string(),
                 }
-                Ok((s, h)) => match guard("boolean result", || recorded::truck_result(s, h, size, &keep, &counts)) {
-                    Ok(body) => {
-                        let (ok, v) = check(&body);
+            }
+        } else {
+            // The remaining shifted and refined tries solve the same pair independently.
+            // Run them together and replay their outcomes below in attempt order, so a
+            // storm of slow sequential solves costs one slow solve instead. The pool
+            // is the crate's ordered parallel map: serial (and wasm-safe) without
+            // worker threads, with one item's panic contained as that item's error.
+            if pooled.is_none() {
+                // (attempt index, tolerance scale): the six tries below, in order.
+                let combos = [(1usize, 2e-3), (1, 5e-4), (2, 2e-3), (2, 5e-4), (3, 2e-3), (3, 5e-4)];
+                pooled = Some(
+                    crate::par::map("jitter attempts", &combos, parallel, |&(ai, kk)| {
+                        let tol = (size * kk).max(1e-5);
+                        let sh = mt::Vector3::new(JITTER[ai][0], JITTER[ai][1], JITTER[ai][2]) * (size * 0.01);
+                        let (outcome, diag) = capture_boolean_diagnostics(|| match intersect(a, b, op, Some(sh), tol) {
+                            Ok((s, _)) if s.boundaries().is_empty() || s.face_iter().next().is_none() => PoolOut::Empty,
+                            Ok((s, h)) => match guard("boolean result", || recorded::truck_result(s, h, size, &keep, &counts)) {
+                                Ok(body) => {
+                                    let (ok, v) = check(&body);
+                                    let fused = !ok && unfused(&body);
+                                    PoolOut::Solved { body, ok, v, unfused: fused }
+                                }
+                                Err(e) => PoolOut::Failed(e.to_string()),
+                            },
+                            Err(e) => PoolOut::Failed(e.to_string()),
+                        });
+                        Ok((outcome, diag))
+                    })
+                    .into_iter()
+                    .map(|r| r.unwrap_or_else(|e| (PoolOut::Failed(e.to_string()), BooleanDiagnostics::default())))
+                    .collect(),
+                );
+            }
+            let Some(outs) = pooled.as_mut() else {
+                return Err(KernelError::Internal("jitter pool missing".into()));
+            };
+            for k in [2e-3, 5e-4] {
+                let tol = (size * k).max(1e-5);
+                // Outcomes are replayed in attempt order; their diagnostics merge in
+                // that order at the same points the sequential loop's records would
+                // reach the caller: on a win, and on the paths returning a result
+                // below. Dropped altogether when the boolean fails, as before.
+                let (outcome, diag) = outs.remove(0);
+                pool_diags.push(diag);
+                match outcome {
+                    PoolOut::Empty => {
+                        empty_votes += 1;
+                        if attempt > 0 || k != 2e-3 {
+                            let mut event =
+                                BooleanFallback::new(if attempt > 0 { BooleanStrategy::ShiftedOperands } else { BooleanStrategy::RefinedTolerance });
+                            event.translation_mm = Vec3::new(j[0], j[1], j[2]).len() * (size * 0.01);
+                            event.tolerance_mm = tol;
+                            empty_diagnostics.push(event);
+                        }
+                        last = "empty result".into();
+                    }
+                    PoolOut::Solved { body, ok, v, unfused: fused } => {
                         if ok {
+                            for d in std::mem::take(&mut pool_diags) {
+                                merge(d);
+                            }
                             if attempt > 0 || k != 2e-3 {
                                 let mut event = BooleanFallback::new(if attempt > 0 {
                                     BooleanStrategy::ShiftedOperands
@@ -1715,18 +1824,20 @@ where
                             }
                             return Ok(Some(body));
                         }
-                        last = if unfused(&body) {
+                        last = if fused {
                             "the bodies touch along faces that could not be fused".into()
                         } else {
                             format!("implausible result volume {v:.4}")
                         };
                     }
-                    Err(e) => last = e.to_string(),
-                },
-                Err(e) => last = e.to_string(),
+                    PoolOut::Failed(e) => last = e,
+                }
             }
         }
         if empty_votes >= 2 && op != BoolOp::Union {
+            for d in std::mem::take(&mut pool_diags) {
+                merge(d);
+            }
             if let Some(body) = fine(&mut last) {
                 return Ok(Some(body));
             }
@@ -1736,6 +1847,9 @@ where
             merge(empty_diagnostics);
             return Ok(None);
         }
+    }
+    for d in std::mem::take(&mut pool_diags) {
+        merge(d);
     }
     last.push_str(&apart_failed);
     // Coincident faces defeat the B-rep boolean; bodies with only planar faces have an exact
