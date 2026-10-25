@@ -2343,8 +2343,15 @@ pub fn select_profiles(ss: &SolvedSketch, sel: &ProfileSel) -> Result<Vec<Region
         // edges) only counts when the drawn curves alone make no profile. Text is drawn, and
         // its letters keep their counters as holes (the counters are not filled in).
         ProfileSel::All => {
-            let drawn = solidcraft_sketch::find_drawn_profiles(&ss.sketch);
-            let chosen = if drawn.is_empty() { ps.clone() } else { drawn };
+            // Fast path: with no projected reference geometry the drawn curves are all
+            // curves, so `find_drawn_profiles` would repeat the `find_profiles` whose
+            // result `ss.profiles` already is.
+            let chosen = if ss.sketch.curves.iter().all(|c| c.link.is_none()) {
+                ps.clone()
+            } else {
+                let drawn = solidcraft_sketch::find_drawn_profiles(&ss.sketch);
+                if drawn.is_empty() { ps.clone() } else { drawn }
+            };
             solidcraft_sketch::without_text_counters(&ss.sketch, chosen).into_iter().map(|p| p.region).collect()
         }
         ProfileSel::Indices { indices } => {
