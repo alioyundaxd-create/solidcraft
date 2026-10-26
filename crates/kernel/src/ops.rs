@@ -919,7 +919,6 @@ fn take_attempt() -> bool {
 pub fn boolean(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
     crate::profile::timed(crate::profile::Kind::Boolean, || boolean_untimed(a, b, op))
 }
-
 fn boolean_untimed(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
     if let Some(r) = with_hollow_tool(a, b, op) {
         return finished(a, b, op, Ok(r));
@@ -1894,7 +1893,59 @@ where
             })
         };
         let mut used = 0;
-        let (mut r, mut diagnostics) = nudge(used, 1.0);
+        // Every screw displacement solves the same pair independently: run them
+        // together and replay the decisions below in screw order, so a gauntlet of
+        // slow sequential nudged booleans costs one slow boolean instead. Order,
+        // diagnostics and fallthrough are identical to the sequential calls.
+        // (Only without an explicit attempt budget, like the jitter pool above.)
+        let nudge_all: Option<Vec<((usize, f64), (Result<Option<Body>>, BooleanDiagnostics))>> = if parallel {
+            let jobs: Vec<(usize, f64)> = (0..SCREWS.len()).flat_map(|s| [(s, 1.0), (s, -1.0)]).collect();
+            let nudge_r = &nudge;
+            let outs = crate::par::map("nudge screws", &jobs, true, move |(screw, sign)| {
+                // The sequential path runs these with the apart flag set (set around
+                // the whole nudge section); mirror it here and restore it afterwards,
+                // as worker threads are reused by the pool.
+                APART.with(|c| c.set(true));
+                struct RestoreApart;
+                impl Drop for RestoreApart {
+                    fn drop(&mut self) {
+                        APART.with(|c| c.set(false));
+                    }
+                }
+                let _restore = RestoreApart;
+                Ok::<_, KernelError>(nudge_r(*screw, *sign))
+            });
+            // A panicking worker is that item's error, as everywhere else in this
+            // file panics are; but an unwind must not skip the apart-flag restore
+            // below, so surface it as a boolean error instead.
+            let mut collected = Vec::with_capacity(jobs.len());
+            for r in outs {
+                match r {
+                    Ok(out) => collected.push(out),
+                    Err(e) => {
+                        APART.with(|c| c.set(false));
+                        return Err(e);
+                    }
+                }
+            }
+            Some(jobs.into_iter().zip(collected).collect())
+        } else {
+            None
+        };
+        let mut nudged = nudge_all.map(|v| v.into_iter());
+        let mut next_nudge = |screw: usize, sign: f64| -> (Result<Option<Body>>, BooleanDiagnostics) {
+            // The pool holds one outcome per sequential call below, in order; if it
+            // ever ran dry (which it cannot: six calls at most), fall back to the
+            // sequential call rather than failing.
+            if let Some(it) = nudged.as_mut() {
+                if let Some(((s, g), out)) = it.next() {
+                    debug_assert_eq!((s, g), (screw, sign));
+                    return out;
+                }
+            }
+            nudge(screw, sign)
+        };
+        let (mut r, mut diagnostics) = next_nudge(used, 1.0);
         // A nudge that pushes a face into a curved face it only touched (a cut whose end lies
         // tangent to a round side) leaves a sliver of that face behind, a fraction of a
         // millimetre wide, which later features (a shell, a fillet) can't work with. The
@@ -1907,7 +1958,7 @@ where
         };
         let made = slivers.is_none_or(|n| n > 0 && n > sliver_faces(a, size).saturating_add(sliver_faces(b, size)));
         if !matches!(r, Ok(None)) && made {
-            let (r2, diagnostics2) = nudge(used, -1.0);
+            let (r2, diagnostics2) = next_nudge(used, -1.0);
             if let Ok(Some(body)) = &r2
                 && slivers.is_none_or(|n| sliver_faces(body, size) < n)
                 && check(body).0
@@ -1926,7 +1977,7 @@ where
         if !works(&r) {
             'screws: for screw in 1..SCREWS.len() {
                 for sign in [1.0, -1.0] {
-                    let (r2, diagnostics2) = nudge(screw, sign);
+                    let (r2, diagnostics2) = next_nudge(screw, sign);
                     if matches!(&r2, Ok(Some(body)) if check(body).0) {
                         (r, diagnostics, used) = (r2, diagnostics2, screw);
                         break 'screws;
